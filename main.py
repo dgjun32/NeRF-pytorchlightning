@@ -14,17 +14,19 @@ from model import NeRF
 if __name__ == '__main__':
     train_data = torch.from_numpy(np.load('data/training_data.pkl', allow_pickle=True))
     test_data = torch.from_numpy(np.load('data/testing_data.pkl', allow_pickle=True))
-    val_data = test_data[:160000, :]
+    val_data = test_data[:160000, :] 
 
     train_loader = DataLoader(train_data, batch_size=1024, shuffle=True)
     val_loader = DataLoader(val_data, batch_size=2048, shuffle=False)
 
-    model = NeRF(device=torch.device('cuda'))
+    model = NeRF()
 
     trainer = pl.Trainer(
-                        max_epochs = 20,
-                        accelerator = 'cuda'
-                        )
-
+                     max_epochs = 20,
+                     accelerator = 'cuda',
+                     check_val_every_n_epoch = 1,
+                     num_sanity_val_steps=0
+                     )
+    
     trainer.fit(model, train_loader, val_loader)
 

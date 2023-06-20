@@ -17,44 +17,44 @@ class NeRF(pl.LightningModule):
                                    nn.Linear(dim, dim), nn.ReLU(),
                                    nn.Linear(dim, dim), nn.ReLU(),
                                    nn.Linear(dim, dim), nn.ReLU(),)
-        self.mlp_2 = nn.Sequential(nn.Linear(6*L_pos+3, dim), nn.ReLU(),
+        self.mlp_2 = nn.Sequential(nn.Linear(6*L_pos+3 + dim, dim), nn.ReLU(),
                                    nn.Linear(dim, dim), nn.ReLU(),
                                    nn.Linear(dim, dim), nn.ReLU(),
                                    nn.Linear(dim, dim), nn.ReLU(),)
-        
-        self.mlp_3 = nn.Sequential(nn.Linear(dim + 6*L_dir+3, dim//2), nn.ReLU())
+
+        self.mlp_3 = nn.Sequential(nn.Linear(dim + 6*L_dir+2, dim//2), nn.ReLU())
         self.mlp_4 = nn.Sequential(nn.Linear(dim//2, 3), nn.Sigmoid())
         self.L_pos = L_pos
         self.L_dir = L_dir
         self.n_bins = n_bins
         #self.device = torch.device('cuda')
-        self.validation_step_outputs = {}
+        self.validation_step_outputs = {'pred':[], 'g.t':[]}
 
     def forward(self, ray_origins, ray_directions):
         '''
         ray_origins : 3D coordinate of viewing position (bsz, 3)
         ray_directions : 3D coordinate of viewing direction (bsz, 3)
         '''
-        # sampling ray along the ray (ray_origins + t * ray_directions)
+        # sampling o and d along the ray (ray_origins (o) + t * ray_directions (d))
         o, d, delta = self.sample_ray(ray_origins, ray_directions)
         '''
-        o : sampled 3D coordinate of the point that ray comes from (bsz, n_bins, 3) 
+        o : sampled 3D coordinate of the point that ray comes from (bsz, n_bins, 3)
         d : sampled 3D coordinate of the direction that ray comes from (bsz, n_bins, 3)
         delta : (bsz, n_bins) - all rows are same
         '''
         # mapping to high dimensional space (positional encoding)
-        o = self.apply_pos_enc(o.reshape(-1, 3), self.L_pos) # (bsz*n_bins, 63)
-        d = self.apply_pos_enc(d.reshape(-1, 3), self.L_dir) # (bsz*n_bins, 27)
+        o_emb = self.apply_pos_enc(o.reshape(-1, 3), self.L_pos) # (bsz*n_bins, 63)
+        d_emb = self.apply_pos_enc(d.reshape(-1, 3), self.L_dir) # (bsz*n_bins, 27)
 
         # get color and density prediction from each sampled points
-        x = self.mlp_1(o)
-        temp = self.mlp_2(torch.cat([x, o], dim=-1))
+        x = self.mlp_1(o_emb)
+        temp = self.mlp_2(torch.cat([x, o_emb], dim=-1))
         x, sigma = temp[:, :-1], F.relu(temp[:, -1])
-        x = self.mlp_3(torch.cat([x, d], dim=-1))
+        x = self.mlp_3(torch.cat([x, d_emb], dim=-1))
         color = self.mlp_4(x)
-        color, sigma = color.reshape(o.shape), sigma(o.shape[0], o.shape[1]) # (bsz, n_bins, 3), (bsz, n_bins)
-
+        color, sigma = color.reshape(o.shape), sigma.reshape(o.shape[0], o.shape[1]) # (bsz, n_bins, 3), (bsz, n_bins)
         pixel_pred = self.volume_rendering(color, sigma, delta) # (bsz, 3)
+        return pixel_pred
 
     def apply_pos_enc(self, x, L):
         out = [x]
@@ -66,7 +66,7 @@ class NeRF(pl.LightningModule):
     def volume_rendering(self, color, sigma, delta):
         '''
         color : (bsz, n_bins, 3) - estimated "color" from ray of n_bins sampled points
-        sigma : (bsz, n_bins) - estimated "density" from ray of n_bins sampled points 
+        sigma : (bsz, n_bins) - estimated "density" from ray of n_bins sampled points
         delta : (bsz, n_bins) - all rows are same
         '''
         alpha = 1 - torch.exp(-sigma * delta) # (bsz, n_bins)
@@ -77,9 +77,9 @@ class NeRF(pl.LightningModule):
 
     def compute_accumulated_transmittance(self, alphas):
         accumulated_transmittance = torch.cumprod(alphas, 1)
-        return torch.cat((torch.ones((accumulated_transmittance.shape[0], 1)),
+        return torch.cat((torch.ones((accumulated_transmittance.shape[0], 1)).to(torch.device('cuda')),
                         accumulated_transmittance[:, :-1]), dim=-1)
-        
+
     def sample_ray(self, ray_origins, ray_directions, tn=0, tf=0.5):
         '''
         ray_origins : 3D coordinate of viewing position (bsz, 3)
@@ -87,22 +87,22 @@ class NeRF(pl.LightningModule):
         '''
         bsz = ray_origins.shape[0]
         # stratified sampling along the ray (o + td)
-        t = torch.linspace(tn, tf, self.n_bins).expand(bsz, self.n_bins) # (bsz, n_bins)
+        t = torch.linspace(tn, tf, self.n_bins).expand(bsz, self.n_bins).to(torch.device('cuda')) # (bsz, n_bins)
         mid = (t[:, :-1] + t[:, 1:]) / 2.
         lower = torch.cat((t[:, :1], mid), -1)
         upper = torch.cat((mid, t[:, -1:]), -1)
-        u = torch.rand(t.shape)
+        u = torch.rand(t.shape).to(torch.device('cuda'))
         t = lower + (upper - lower) * u  # (bsz, n_bins)
-        delta = torch.cat((t[:, 1:] - t[:, :-1], torch.tensor([1e10]).expand(bsz, 1)), -1) 
-        # delta : (bsz, n_bins) : last column is filled with large float 
+        delta = torch.cat((t[:, 1:] - t[:, :-1], torch.tensor([1e10]).expand(bsz, 1).to(torch.device('cuda'))), -1)
+        # delta : (bsz, n_bins) : last column is filled with large float
 
         # batch expression of x = o + td (starting coordinate of the ray)
         x = ray_origins.unsqueeze(1) + t.unsqueeze(2)*ray_directions.unsqueeze(1) # (bsz, n_bins, 3)
         ray_directions = ray_directions.expand(self.n_bins, bsz, 3).transpose(0, 1) # (bsz, n_bins, 3) - sample value along the dimension 1 (as ray direction does not depend on the sampling along the ray)
 
         return x, ray_directions, delta
-    
-    def training_step(self, batch):
+
+    def training_step(self, batch, batch_idx):
         pos = batch[:, 0:3]
         dir = batch[:, 3:6]
         y = batch[:, 6:]
@@ -110,11 +110,10 @@ class NeRF(pl.LightningModule):
         pred = self.forward(pos, dir)
         # compute loss
         loss = ((y - pred)**2).sum()
-        self.log('train_loss', loss)
-
+        #print('train_loss : {}'.format(loss.item()))
         return {'loss' : loss}
 
-    def validation_step(self, batch):
+    def validation_step(self, batch, batch_idx):
         pos = batch[:, 0:3]
         dir = batch[:, 3:6]
         y = batch[:, 6:]
@@ -133,9 +132,9 @@ class NeRF(pl.LightningModule):
         plt.subplot(122)
         plt.imshow(gt_pixel)
         plt.title('real image')
-        self.validation_step_outputs.clear()
-        self.validation_step_outputs['pred'] = []
-        self.validation_step_outputs['g.t'] = []
+        plt.savefig(fig, 'output/validation_sample_ep{}'.format(self.current_epoch))
+        self.validation_step_outputs['pred'].clear()
+        self.validation_step_outputs['g.t'].clear()
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=5e-4)
